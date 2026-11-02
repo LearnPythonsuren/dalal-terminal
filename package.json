@@ -1,10 +1,13 @@
 {
   "name": "dalal-terminal",
   "version": "1.0.0",
-  "description": "Single-page NSE trading terminal dashboard (heat map, fundamentals, mutual funds, IPO, news) with a GFDL REST proxy.",
+  "description": "Single-page NSE trading terminal (heat map, fundamentals, mutual funds, IPO, news). Price streams over GFDL WebSockets; other data via GFDL REST.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "8.18.0"
   },
   "engines": {
     "node": ">=18"

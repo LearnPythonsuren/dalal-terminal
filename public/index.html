@@ -330,7 +330,7 @@ svg.spark{width:100%;height:40px;display:block}
 const CFG_KEY="dalal_terminal_cfg_v1";
 const DEFAULT_BASE="https://test.lisuns.com:4532";
 const API_DEFS=[
-  {id:"price",       name:"Price / Market Data", ds:"Quotes, snapshots, gainers/losers, heat map", color:"#2f6bff", fns:"GetLastQuote · GetLastQuoteArray · GetSnapshot · GetTopGainersLosers"},
+  {id:"price",       name:"Price / Market Data", ds:"Live quotes & heat map over WebSocket", color:"#2f6bff", ws:true, fns:"WS Authenticate · SubscribeRealtime → RealtimeResult"},
   {id:"fundamental", name:"Fundamentals",        ds:"Ratios, P/E, company data, financials",       color:"#16c784", fns:"GetFinancialRatios · GetPERatio · GetCompanyData · GetFinancialResults"},
   {id:"mf",          name:"Mutual Fund",          ds:"NAV, scheme master, AUM, holdings",           color:"#f0b90b", fns:"GetNAV · GetNAVHistory · GetSchemeMaster · GetAUM"},
   {id:"ipo",         name:"IPO",                  ds:"IPO info & subscription data",                color:"#22d3ee", fns:"GetIPOInformationData · GetIPOSubscriptionData · GetNewFundOffers"},
@@ -340,13 +340,22 @@ function loadCfg(){
   let base={};
   try{base=JSON.parse(localStorage.getItem(CFG_KEY))||{}}catch(e){}
   const cfg={apis:{},prefs:Object.assign({exchange:"NSE",universe:"NIFTY50",segment:"CASH",refresh:30,autorefresh:false},base.prefs||{})};
-  API_DEFS.forEach(d=>{cfg.apis[d.id]=Object.assign({base:DEFAULT_BASE,token:""},(base.apis||{})[d.id]||{})});
+  API_DEFS.forEach(d=>{
+    const def=d.ws?{wsurl:"",token:""}:{base:DEFAULT_BASE,token:""};
+    cfg.apis[d.id]=Object.assign(def,(base.apis||{})[d.id]||{});
+  });
   return cfg;
 }
 function saveCfg(c){try{localStorage.setItem(CFG_KEY,JSON.stringify(c))}catch(e){}}
 let CFG=loadCfg();
-function hasToken(api){return !!(CFG.apis[api]&&CFG.apis[api].token&&CFG.apis[api].token.trim())}
+function hasToken(api){
+  const c=CFG.apis[api]; if(!c)return false;
+  const d=API_DEFS.find(x=>x.id===api);
+  if(d&&d.ws) return !!(c.wsurl&&c.wsurl.trim()&&c.token&&c.token.trim());
+  return !!(c.token&&c.token.trim());
+}
 function liveEnabled(){return API_DEFS.some(d=>hasToken(d.id))}
+function priceStreamConfigured(){const c=CFG.apis.price;return !!(c&&c.wsurl&&c.wsurl.trim()&&c.token&&c.token.trim());}
 
 /* ============================================================
    API layer — resilient GFDL REST caller + normaliser.
@@ -386,6 +395,89 @@ function normalise(txt){
   const out=[];for(const p of parts){try{out.push(JSON.parse(p))}catch(e){}}
   return out;
 }
+
+/* ============================================================
+   PRICE STREAM — GFDL WebSocket (SubscribeRealtime → RealtimeResult)
+   Hosted build: connect to same-origin /ws, which relays to the GFDL
+   socket after auth. Local file: connect straight to the GFDL endpoint
+   and authenticate here. Published artifact: WS blocked → sample mode.
+   ============================================================ */
+const LIVE={};           // "EXCH:SYM" -> latest RealtimeResult (mapped fields)
+const PXBUF={};          // "EXCH:SYM" -> [{t,px}] rolling buffer for 1m/5m change
+let STREAM=null;
+function liveKey(ex,sym){return ex+":"+sym;}
+function recordTick(r){
+  const ex=r.EXCHANGE||r.Exchange, sym=r.INSTRUMENTIDENTIFIER||r.InstrumentIdentifier;
+  if(!sym)return;
+  const px=+(r.LASTTRADEPRICE??r.LastTradePrice??0);
+  const k=liveKey(ex,sym);
+  LIVE[k]={px, close:+(r.CLOSE??r.Close??0), open:+(r.OPEN??r.Open??0), high:+(r.HIGH??r.High??0), low:+(r.LOW??r.Low??0),
+    dch:+(r.PRICECHANGEPERCENTAGE??r.PriceChangePercentage??0), vol:+(r.TOTALQTYTRADED??r.TotalQtyTraded??0),
+    val:+(r.VALUE??r.Value??0), t:+(r.LASTTRADETIME??r.LastTradeTime??Date.now())};
+  const buf=PXBUF[k]||(PXBUF[k]=[]); const now=Date.now();
+  if(px>0){buf.push({t:now,px}); while(buf.length&&now-buf[0].t>360000)buf.shift();}
+}
+function intradayPct(k,secs){
+  const buf=PXBUF[k]; if(!buf||buf.length<2)return null;
+  const now=Date.now(),cut=now-secs*1000; let base=null;
+  for(const p of buf){ if(p.t<=cut)base=p.px; else break; }
+  if(base==null)base=buf[0].px;
+  const last=buf[buf.length-1].px;
+  return base?(last-base)/base*100:null;
+}
+class GfdlStream{
+  constructor(onTick,onState){this.onTick=onTick;this.onState=onState;this.ws=null;this.ready=false;this.subs=new Set();this.retry=0;this.manualClose=false;}
+  _state(s,info){this.state=s;this.onState&&this.onState(s,info);}
+  connect(){
+    const c=CFG.apis.price; if(!c||!c.wsurl||!c.token){this._state("unconfigured");return;}
+    this.manualClose=false;
+    const hosted=location.protocol==="http:"||location.protocol==="https:";
+    let url;
+    if(hosted){ url=(location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/ws"; }
+    else { url=c.wsurl; }
+    this._state("connecting");
+    let ws; try{ ws=new WebSocket(url); }catch(e){ this._state("error","bad ws url"); this._scheduleRetry(); return; }
+    this.ws=ws; this.hosted=hosted;
+    ws.onopen=()=>{
+      if(hosted){ ws.send(JSON.stringify({__open:{endpoint:c.wsurl,token:c.token}})); }
+      else { ws.send(JSON.stringify({MessageType:"Authenticate",Password:c.token})); }
+    };
+    ws.onmessage=ev=>{
+      let m; try{m=JSON.parse(ev.data);}catch(e){return;}
+      if(m.__ready){ this._onReady(); return; }
+      if(m.__error){ this._state("error",m.__error); return; }
+      if(m.__upstream_closed!=null){ this._state("closed"); return; }
+      if(m.MessageType==="AuthenticateResult"){ if(m.Complete)this._onReady(); else this._state("error","auth failed"); return; }
+      if(m.MessageType==="RealtimeResult"){ recordTick(m); this.onTick&&this.onTick(m); return; }
+    };
+    ws.onclose=()=>{ this.ready=false; if(!this.manualClose){ this._state("closed"); this._scheduleRetry(); } };
+    ws.onerror=()=>{ this._state("error","socket error"); };
+  }
+  _onReady(){ this.ready=true; this.retry=0; this._state("live"); const s=[...this.subs]; this.subs.clear(); if(s.length)this.subscribe(s); }
+  _scheduleRetry(){ if(this.manualClose)return; this.retry=Math.min(this.retry+1,6); clearTimeout(this._rt); this._rt=setTimeout(()=>this.connect(),1000*this.retry); }
+  subscribe(list){ // list of {ex,sym} or "EX:SYM"
+    const items=list.map(x=>typeof x==="string"?{ex:x.split(":")[0],sym:x.split(":").slice(1).join(":")}:x);
+    items.forEach(it=>{ const k=liveKey(it.ex,it.sym); if(this.subs.has(k))return; this.subs.add(k);
+      if(this.ready&&this.ws&&this.ws.readyState===1) this.ws.send(JSON.stringify({MessageType:"SubscribeRealtime",Exchange:it.ex,Unsubscribe:"false",InstrumentIdentifier:it.sym})); });
+  }
+  unsubscribeAll(){ if(this.ready&&this.ws&&this.ws.readyState===1){ this.subs.forEach(k=>{const[ex,...r]=k.split(":");this.ws.send(JSON.stringify({MessageType:"SubscribeRealtime",Exchange:ex,Unsubscribe:"true",InstrumentIdentifier:r.join(":")}));}); } this.subs.clear(); }
+  close(){ this.manualClose=true; clearTimeout(this._rt); try{this.ws&&this.ws.close();}catch(e){} this.ready=false; }
+}
+let streamThrottle=0;
+function startStream(){
+  if(!priceStreamConfigured()){ if(STREAM){STREAM.close();STREAM=null;} updateConn(); return; }
+  if(STREAM)STREAM.close();
+  STREAM=new GfdlStream(
+    ()=>{ const now=Date.now(); if(now-streamThrottle>700){ streamThrottle=now; if(currentView==="heatmap")refreshHeatmapLive(); renderTicker(); } updateConn(); },
+    (s)=>updateConn()
+  );
+  STREAM.connect();
+  // subscribe current universe + indices
+  const syms=buildUniverseRows().map(r=>({ex:"NSE",sym:r.sym}));
+  SAMPLE_INDICES.forEach(ix=>{ if(ix.nm!=="SENSEX") syms.push({ex:"NSE_IDX",sym:ix.nm}); });
+  STREAM.subscribe(syms);
+}
+function streaming(){return STREAM&&STREAM.ready;}
 
 /* ============================================================
    SAMPLE DATA — seeded from live GFDL feed (03 Nov 2026).
@@ -628,7 +720,15 @@ function buildUniverseRows(){
   // universe filter by size (NIFTY50 ~ top 50 by mcap, 100, 500)
   rows.sort((a,b)=>b.mcap-a.mcap);
   const n=state.hm.universe==="NIFTY50"?50:state.hm.universe==="NIFTY100"?100:500;
-  return rows.slice(0,Math.min(n,rows.length));
+  const sel=rows.slice(0,Math.min(n,rows.length));
+  // overlay live ticks where present
+  sel.forEach(r=>{
+    const k=liveKey("NSE",r.sym), L=LIVE[k];
+    if(L){ r.px=L.px||r.px; r.dch=L.dch; r.vol=L.vol||r.vol; r.tov=L.val?L.val/1e7:r.tov;
+      const m1=intradayPct(k,60), m5=intradayPct(k,300);
+      if(m1!=null)r.m1=m1; if(m5!=null)r.m5=m5; r.live=true; }
+  });
+  return sel;
 }
 function metricValue(r){
   const tf=state.hm.tf;
@@ -646,15 +746,7 @@ function renderHeatmap(){
   const adv=rows.filter(r=>(state.hm.tf==="1min"?r.m1:state.hm.tf==="5min"?r.m5:r.dch)>0).length;
   const dec=rows.filter(r=>(state.hm.tf==="1min"?r.m1:state.hm.tf==="5min"?r.m5:r.dch)<0).length;
   const unch=rows.length-adv-dec;
-  // for vol/turnover coloring, compute rank score -1..1 centered
-  let colorScore;
-  if(state.hm.color==="change"){ colorScore=r=>metricValue(r); }
-  else {
-    const vals=rows.map(metricValue).sort((a,b)=>a-b);
-    const med=vals[Math.floor(vals.length/2)];
-    const max=vals[vals.length-1]||1;
-    colorScore=r=>{ const v=metricValue(r); return (v-med)/(max-med||1); }; // ~0..1, dir from sign of daily
-  }
+  const colorScore=makeColorScore(rows);
   const tfLabel={daily:"Daily",["1min"]:"1-min",["5min"]:"5-min"}[state.hm.tf];
   const colorLabel={change:"% Change",volume:"Volume",turnover:"Turnover"}[state.hm.color];
 
@@ -723,6 +815,7 @@ function renderHeatmap(){
 
   // build tiles
   const container=VIEW.querySelector('#heatmap');
+  for(const k in TILES)delete TILES[k];
   const groups = state.hm.group ? groupBySector(rows) : [{sector:null,rows}];
   groups.forEach(g=>{
     const secEl=document.createElement('div');
@@ -742,6 +835,44 @@ function renderHeatmap(){
   clearTimeout(window.__hmrt);
   window.addEventListener('resize',()=>{clearTimeout(window.__hmrt);window.__hmrt=setTimeout(()=>{if(currentView==="heatmap")renderHeatmap();},180);},{once:true});
 }
+function makeColorScore(rows){
+  if(state.hm.color==="change") return r=>metricValue(r);
+  const vals=rows.map(metricValue).sort((a,b)=>a-b);
+  const med=vals[Math.floor(vals.length/2)];
+  const max=vals[vals.length-1]||1;
+  return r=>{ const v=metricValue(r); return (v-med)/(max-med||1); };
+}
+const TILES={}; // sym -> tile element (for in-place live updates)
+function tileVisual(r,colorScore){
+  const dch=state.hm.tf==="1min"?r.m1:state.hm.tf==="5min"?r.m5:r.dch;
+  const score=colorScore(r)*(dch>=0?1:(state.hm.color==="change"?1:-1));
+  const col=hmColor(score,state.hm.color==="change"?"change":"rank");
+  let metricTxt;
+  if(state.hm.color==="change")metricTxt=sign(dch)+"%";
+  else if(state.hm.color==="volume")metricTxt=volCompact(r.vol);
+  else metricTxt="₹"+fmt0(r.tov)+"Cr";
+  return {dch,col,metricTxt};
+}
+function refreshHeatmapLive(){
+  const wrapExists=VIEW.querySelector('#heatmap'); if(!wrapExists)return;
+  const rows=buildUniverseRows();
+  const colorScore=makeColorScore(rows);
+  rows.forEach(r=>{
+    const el=TILES[r.sym]; if(!el)return;
+    const v=tileVisual(r,colorScore);
+    el.style.background=v.col; el.style.color=textOn(v.dch);
+    const pc=el.querySelector('.pc'); if(pc)pc.textContent=v.metricTxt;
+    el.title=`${r.sym}  ₹${fmt(r.px)}\nDaily ${sign(r.dch)}%  ·  1m ${sign(r.m1)}%  ·  5m ${sign(r.m5)}%\nVol ${volCompact(r.vol)}  ·  Turnover ₹${fmt0(r.tov)}Cr  ·  MCap ${compactCr(r.mcap)}`;
+  });
+  // sector header averages
+  VIEW.querySelectorAll('.sector').forEach(sec=>{
+    const nm=sec.querySelector('.sector-hd .nm'); if(!nm)return;
+    const secRows=rows.filter(r=>r.sector===nm.textContent);
+    if(!secRows.length)return;
+    const avg=secRows.reduce((s,r)=>s+(state.hm.tf==="1min"?r.m1:state.hm.tf==="5min"?r.m5:r.dch),0)/secRows.length;
+    const ch=sec.querySelector('.sector-hd .ch'); if(ch){ch.textContent=sign(avg)+"%";ch.className="ch "+pcCls(avg);}
+  });
+}
 function groupBySector(rows){
   const m={};rows.forEach(r=>{(m[r.sector]=m[r.sector]||[]).push(r)});
   return Object.entries(m).map(([sector,rs])=>({sector,rows:rs}))
@@ -757,20 +888,15 @@ function layoutTiles(wrap,rows,colorScore){
   squarify(items,0,0,W,H);
   items.forEach(it=>{
     const r=it.r,rc=it.rect;if(!rc)return;
-    const dch=state.hm.tf==="1min"?r.m1:state.hm.tf==="5min"?r.m5:r.dch;
-    const score=colorScore(r)*(dch>=0?1:(state.hm.color==="change"?1:-1));
-    const col=hmColor(score,state.hm.color==="change"?"change":"rank");
+    const v=tileVisual(r,colorScore);
     const el=document.createElement('div');
     el.className='tile'+((rc.w<46||rc.h<30)?' sm':'');
     el.style.left=rc.x+"px";el.style.top=rc.y+"px";el.style.width=rc.w+"px";el.style.height=rc.h+"px";
-    el.style.background=col;el.style.color=textOn(dch);
+    el.style.background=v.col;el.style.color=textOn(v.dch);
     const fs=Math.max(8,Math.min(15,Math.min(rc.w/5,rc.h/3.2)));
-    let metricTxt;
-    if(state.hm.color==="change")metricTxt=sign(dch)+"%";
-    else if(state.hm.color==="volume")metricTxt=volCompact(r.vol);
-    else metricTxt="₹"+fmt0(r.tov)+"Cr";
-    el.innerHTML=`<span class="sym" style="font-size:${fs}px">${r.sym}</span><span class="pc" style="font-size:${fs*0.82}px">${metricTxt}</span>`;
+    el.innerHTML=`<span class="sym" style="font-size:${fs}px">${r.sym}</span><span class="pc" style="font-size:${fs*0.82}px">${v.metricTxt}</span>`;
     el.title=`${r.sym}  ₹${fmt(r.px)}\nDaily ${sign(r.dch)}%  ·  1m ${sign(r.m1)}%  ·  5m ${sign(r.m5)}%\nVol ${volCompact(r.vol)}  ·  Turnover ₹${fmt0(r.tov)}Cr  ·  MCap ${compactCr(r.mcap)}`;
+    TILES[r.sym]=el;
     wrap.appendChild(el);
   });
 }
@@ -927,11 +1053,14 @@ function renderSettings(){
         <div class="ic" style="background:${d.color}22;color:${d.color}">${svgFor(d.id)}</div>
         <div><div class="nm">${d.name}</div><div class="ds">${d.ds}</div></div>
       </div>
-      <div class="field"><label>Endpoint base URL</label>
-        <input data-k="base" value="${a.base||""}" placeholder="${DEFAULT_BASE}" spellcheck="false"></div>
-      <div class="field"><label>Access token</label>
-        <input data-k="token" type="password" value="${a.token||""}" placeholder="paste ${d.id} access token" spellcheck="false"></div>
-      <div class="note" style="font-size:10px">Functions: <code>${d.fns.split(" · ")[0]}</code> …</div>
+      ${d.ws
+        ? `<div class="field"><label>WebSocket endpoint</label>
+             <input data-k="wsurl" value="${a.wsurl||""}" placeholder="ws://host:port  (from GFDL)" spellcheck="false"></div>`
+        : `<div class="field"><label>Endpoint base URL</label>
+             <input data-k="base" value="${a.base||""}" placeholder="${DEFAULT_BASE}" spellcheck="false"></div>`}
+      <div class="field"><label>${d.ws?"API key":"Access token"}</label>
+        <input data-k="token" type="password" value="${a.token||""}" placeholder="paste ${d.id} ${d.ws?'API key':'access token'}" spellcheck="false"></div>
+      <div class="note" style="font-size:10px">${d.ws?"Streams":"Functions"}: <code>${d.fns.split(" · ")[0]}</code> …</div>
       <div class="set-row"><button class="test-btn" data-test="${d.id}"><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>Test</button><span class="test-res" data-res="${d.id}"></span></div>
     </div>`;
   }).join("");
@@ -939,9 +1068,8 @@ function renderSettings(){
   VIEW.innerHTML=`<div class="panel">
     <div class="hd"><h2>API Keys &amp; Endpoints</h2><span class="sub">Each data class can use its own endpoint and token</span><div class="ln"></div></div>
     <div class="note" style="margin-bottom:14px">
-      Enter a separate base URL and access token for each data class below — <b>Price</b>, <b>Fundamentals</b>, <b>Mutual Fund</b>, <b>IPO</b> and <b>News</b> can all point at different GFDL endpoints/subscriptions.
-      Keys are stored only in this browser (<code>localStorage</code>) and are sent only to the endpoint you configure. Requests are fired as
-      <code>{base}/{Function}/?params&amp;accesstoken={token}</code>. Live calls run when you open the <b>downloaded file</b> locally or self-host it (the published preview blocks cross-site calls).
+<b>Price</b> streams over a <b>WebSocket</b> (GFDL <code>SubscribeRealtime</code> → <code>RealtimeResult</code>); <b>Fundamentals</b>, <b>Mutual Fund</b>, <b>IPO</b> and <b>News</b> use REST — each can point at its own GFDL endpoint/subscription.
+      Keys are stored only in this browser (<code>localStorage</code>). On the hosted build, the server relays both the socket and REST (adding CORS) and never stores your keys; opened as a local file, the browser connects directly.
     </div>
     <div class="set-grid">${cards}</div>
 
@@ -977,13 +1105,14 @@ function renderSettings(){
   VIEW.querySelector('#saveCfg').addEventListener('click',()=>{
     API_DEFS.forEach(d=>{
       const card=VIEW.querySelector(`.set-card[data-api="${d.id}"]`);
-      CFG.apis[d.id].base=card.querySelector('[data-k="base"]').value.trim()||DEFAULT_BASE;
+      if(d.ws){ CFG.apis[d.id].wsurl=card.querySelector('[data-k="wsurl"]').value.trim(); }
+      else { CFG.apis[d.id].base=card.querySelector('[data-k="base"]').value.trim()||DEFAULT_BASE; }
       CFG.apis[d.id].token=card.querySelector('[data-k="token"]').value.trim();
     });
     CFG.prefs.exchange=VIEW.querySelector('#prefExch').value;
     CFG.prefs.refresh=Math.max(5,parseInt(VIEW.querySelector('#prefRefresh').value)||30);
     CFG.prefs.autorefresh=VIEW.querySelector('#prefAuto').checked;
-    saveCfg(CFG);updateConn();
+    saveCfg(CFG);updateConn();startStream();
     const m=VIEW.querySelector('#saveMsg');m.textContent="✓ Saved";m.style.color="var(--up)";setTimeout(()=>m.textContent="",2500);
     renderTicker();
   });
@@ -1004,18 +1133,34 @@ function svgFor(id){
 async function testConn(api){
   const res=VIEW.querySelector(`[data-res="${api}"]`);
   const card=VIEW.querySelector(`.set-card[data-api="${api}"]`);
-  // use the in-field values, not saved
-  const base=card.querySelector('[data-k="base"]').value.trim()||DEFAULT_BASE;
   const token=card.querySelector('[data-k="token"]').value.trim();
   res.style.color="var(--muted)";res.textContent="testing…";
+  const def=API_DEFS.find(d=>d.id===api);
+  if(def&&def.ws){ // WebSocket probe (auth handshake, then close)
+    const wsurl=(card.querySelector('[data-k="wsurl"]').value||"").trim();
+    if(!wsurl){res.style.color="var(--down)";res.textContent="✕ set WebSocket endpoint";return;}
+    const hosted=location.protocol==="http:"||location.protocol==="https:";
+    const url=hosted?((location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/ws"):wsurl;
+    let done=false;
+    try{
+      const ws=new WebSocket(url);
+      const to=setTimeout(()=>{if(!done){done=true;res.style.color="var(--down)";res.textContent="✕ timeout";try{ws.close()}catch(e){}}},9000);
+      ws.onopen=()=>{ if(hosted)ws.send(JSON.stringify({__open:{endpoint:wsurl,token}})); else ws.send(JSON.stringify({MessageType:"Authenticate",Password:token})); };
+      ws.onmessage=ev=>{ let m;try{m=JSON.parse(ev.data)}catch(e){return;}
+        if(m.__ready||(m.MessageType==="AuthenticateResult"&&m.Complete)){done=true;clearTimeout(to);res.style.color="var(--up)";res.textContent="✓ authenticated";try{ws.close()}catch(e){}}
+        else if(m.__error||(m.MessageType==="AuthenticateResult"&&!m.Complete)){done=true;clearTimeout(to);res.style.color="var(--down)";res.textContent="✕ "+(m.__error||"auth failed");try{ws.close()}catch(e){}} };
+      ws.onerror=()=>{ if(!done){done=true;clearTimeout(to);res.style.color="var(--down)";res.textContent=hosted?"✕ /ws unreachable":"✕ blocked here — use hosted build";} };
+    }catch(e){res.style.color="var(--down)";res.textContent="✕ bad ws url";}
+    return;
+  }
+  const base=card.querySelector('[data-k="base"]').value.trim()||DEFAULT_BASE;
   const saved={...CFG.apis[api]};CFG.apis[api]={base,token};
-  const probe={price:["GetServerInfo",{}],fundamental:["GetServerInfo",{}],mf:["GetServerInfo",{}],ipo:["GetServerInfo",{}],news:["GetServerInfo",{}]};
   try{
-    await gfdl(api,probe[api][0],probe[api][1]);
+    await gfdl(api,"GetServerInfo",{});
     res.style.color="var(--up)";res.textContent="✓ reachable";
   }catch(e){
     res.style.color="var(--down)";
-    res.textContent=/Failed to fetch|NetworkError|CSP|cors/i.test(e.message||"")?"✕ blocked here — run the downloaded file":"✕ "+(e.message||"unreachable");
+    res.textContent=/Failed to fetch|NetworkError|CSP|cors/i.test(e.message||"")?"✕ blocked here — use hosted build":"✕ "+(e.message||"unreachable");
   }finally{CFG.apis[api]=saved;}
 }
 
@@ -1023,7 +1168,11 @@ async function testConn(api){
    ticker + clock + status
    ============================================================ */
 function renderTicker(){
-  const items=SAMPLE_INDICES.map(ix=>`<span class="tk"><span class="nm">${ix.nm}</span><span class="px">${fmt(ix.px,2)}</span><span class="ch ${pcCls(ix.pc)}">${sign(ix.ch)} (${sign(ix.pc)}%)</span></span>`).join("");
+  const items=SAMPLE_INDICES.map(ix=>{
+    const L=LIVE[liveKey("NSE_IDX",ix.nm)];
+    const px=L?L.px:ix.px, pc=L?L.dch:ix.pc, ch=L?(L.px-L.close):ix.ch;
+    return `<span class="tk"><span class="nm">${ix.nm}</span><span class="px">${fmt(px,2)}</span><span class="ch ${pcCls(pc)}">${sign(ch)} (${sign(pc)}%)</span></span>`;
+  }).join("");
   document.getElementById("tickTrack").innerHTML=items+items; // duplicate for seamless loop
 }
 function updateClock(){
@@ -1033,7 +1182,13 @@ function updateClock(){
 }
 function updateConn(){
   const dot=document.getElementById("connDot"),txt=document.getElementById("connText");
-  if(liveEnabled()){dot.className="dot live";txt.textContent="Live mode ("+API_DEFS.filter(d=>hasToken(d.id)).length+"/5 keys)";}
+  if(STREAM){
+    const s=STREAM.state;
+    if(s==="live"){dot.className="dot live";txt.textContent="● Streaming ("+STREAM.subs.size+" symbols)";return;}
+    if(s==="connecting"){dot.className="dot";txt.textContent="Connecting stream…";return;}
+    if(s==="error"||s==="closed"){dot.className="dot err";txt.textContent="Stream "+s+" — retrying";return;}
+  }
+  if(liveEnabled()){dot.className="dot live";txt.textContent="Live ("+API_DEFS.filter(d=>hasToken(d.id)).length+"/5 configured)";}
   else{dot.className="dot";txt.textContent="Sample data";}
 }
 
@@ -1044,4 +1199,6 @@ document.getElementById("refreshAll").addEventListener("click",()=>{render();con
 // honor hash on load
 (function(){const h=(location.hash||"").replace("#","");if(h&&h!=="heatmap"){const b=document.querySelector('.nav-btn[data-view="'+h+'"]');if(b){document.querySelectorAll(".nav-btn").forEach(x=>x.classList.remove("on"));b.classList.add("on");currentView=h;}}})();
 render();
+// open the price stream if configured (hosted build or local file)
+startStream();
 </script>
