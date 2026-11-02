@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: dalal-terminal
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: GFDL_ALLOWED_HOSTS
+        sync: false
+    healthCheckPath: /healthz
